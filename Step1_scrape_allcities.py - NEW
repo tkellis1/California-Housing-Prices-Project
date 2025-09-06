@@ -1,0 +1,1950 @@
+
+#!/usr/bin/env python3
+"""California Real Estate Mega Scraper - Complete Production Version"""
+
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import time
+import re
+import random
+import json
+import logging
+import os
+import pickle
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+import sys
+
+# Setup logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f'scraping_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class CaliforniaRealEstateScraper:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1"
+        })
+        self.scraped_urls = set()
+        self.all_listings = []
+        self.current_city_index = 0
+        self.failed_urls = set()
+        self.stats = {
+            'total_requests': 0,
+            'successful_requests': 0,
+            'failed_requests': 0,
+            'rate_limit_hits': 0
+        }
+        Path('data').mkdir(exist_ok=True)
+        Path('logs').mkdir(exist_ok=True)
+    
+    def make_request_with_retry(self, url, max_retries=3):
+        """Make HTTP request with comprehensive retry logic"""
+        for attempt in range(max_retries + 1):
+            try:
+                self.stats['total_requests'] += 1
+                time.sleep(random.uniform(3, 8))
+                
+                response = self.session.get(url, timeout=30)
+                
+                if response.status_code == 200:
+                    self.stats['successful_requests'] += 1
+                    return response
+                elif response.status_code == 429:
+                    self.stats['rate_limit_hits'] += 1
+                    wait_time = min((2 ** attempt) * 60, 1800)  # Max 30 min
+                    logger.warning(f"Rate limited! Waiting {wait_time//60}m {wait_time%60}s...")
+                    time.sleep(wait_time)
+                    continue
+                elif response.status_code in [403, 503, 504]:
+                    wait_time = min(300 + (attempt * 60), 900)
+                    logger.warning(f"Server error {response.status_code}. Waiting {wait_time//60}m...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.warning(f"HTTP {response.status_code} for {url} (attempt {attempt + 1})")
+                
+                if attempt < max_retries:
+                    time.sleep(random.uniform(15, 45))
+                    
+            except requests.exceptions.Timeout:
+                logger.warning(f"Timeout for {url} (attempt {attempt + 1})")
+                if attempt < max_retries:
+                    time.sleep(random.uniform(20, 40))
+            except requests.exceptions.ConnectionError as e:
+                logger.warning(f"Connection error: {e}")
+                if attempt < max_retries:
+                    time.sleep(random.uniform(30, 60))
+            except Exception as e:
+                logger.error(f"Unexpected error: {e}")
+                if attempt < max_retries:
+                    time.sleep(random.uniform(25, 50))
+        
+        self.stats['failed_requests'] += 1
+        self.failed_urls.add(url)
+        return None
+    
+    def extract_listing_details(self, detail_url):
+        """Extract comprehensive listing details"""
+        try:
+            response = self.make_request_with_retry(detail_url)
+            if not response:
+                return {}
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            details = {}
+            page_text = soup.get_text()
+            
+            # Extract description from JavaScript
+            scripts = soup.find_all('script')
+            for script in scripts:
+                script_content = script.string or ''
+                if 'listingRemarks' in script_content:
+                    match = re.search(r'"listingRemarks":\s*"([^"]*)"', script_content)
+                    if match:
+                        desc = match.group(1)
+                        desc = desc.replace('\\n', ' ').replace('\\"', '"').replace('\\/', '/')
+                        desc = desc.replace('\\u0026', '&').replace('\\u0027', "'")
+                        if len(desc) > 50:
+                            details['full_description'] = desc[:2000]
+                            break
+            
+            # Extract year built
+            year_patterns = [
+                r'"yearBuilt"[:\s]*(\d{4})',
+                r'Built[:\s]*in[:\s]*(\d{4})',
+                r'Year Built[:\s]*(\d{4})'
+            ]
+            for pattern in year_patterns:
+                match = re.search(pattern, page_text, re.IGNORECASE)
+                if match:
+                    year = int(match.group(1))
+                    if 1800 <= year <= 2030:
+                        details['year_built'] = year
+                        break
+            
+            # Property type detection
+            url_lower = detail_url.lower()
+            page_lower = page_text.lower()
+            
+            if '/unit-' in url_lower or 'condo' in url_lower or 'condominium' in page_lower:
+                details['property_type'] = 'Condo'
+            elif 'townhome' in url_lower or 'townhouse' in page_lower:
+                details['property_type'] = 'Townhome'
+            elif 'mobile' in page_lower or 'manufactured' in page_lower:
+                details['property_type'] = 'Mobile Home'
+            elif 'multi' in page_lower and 'family' in page_lower:
+                details['property_type'] = 'Multi-Family'
+            else:
+                details['property_type'] = 'Single Family'
+            
+            # Extract lot size
+            lot_patterns = [
+                r'"lotSize"[:\s]*[{\[]*"value"[:\s]*([0-9,]+)',
+                r'Lot Size[:\s]*([0-9,]+(?:\.[0-9]+)?)\s*(?:sq\.?\s?ft|sqft)',
+                r'([0-9,]+(?:\.[0-9]+)?)\s*(?:sq\.?\s?ft|sqft)\s*lot'
+            ]
+            for pattern in lot_patterns:
+                match = re.search(pattern, page_text, re.IGNORECASE)
+                if match:
+                    try:
+                        lot_size = float(match.group(1).replace(',', ''))
+                        if 100 <= lot_size <= 1000000:
+                            details['lot_size_sqft'] = lot_size
+                            break
+                    except (ValueError, IndexError):
+                        continue
+            
+            # Extract HOA fees
+            hoa_patterns = [
+                r'"hoa"[:\s]*[{\[]*"value"[:\s]*([0-9,]+)',
+                r'HOA[:\s]*[\$]?([0-9,]+)',
+                r'Association[:\s]*Fee[:\s]*[\$]?([0-9,]+)'
+            ]
+            for pattern in hoa_patterns:
+                match = re.search(pattern, page_text, re.IGNORECASE)
+                if match:
+                    try:
+                        hoa_fee = float(match.group(1).replace(',', ''))
+                        if 0 < hoa_fee < 5000:
+                            details['hoa_monthly_fee'] = hoa_fee
+                            break
+                    except (ValueError, IndexError):
+                        continue
+            
+            # Extract garage spaces
+            garage_patterns = [
+                r'(\d+)[:\s]*(?:car\s*)?garage',
+                r'garage[:\s]*(\d+)',
+                r'"garageSpaces"[:\s]*(\d+)'
+            ]
+            for pattern in garage_patterns:
+                match = re.search(pattern, page_text, re.IGNORECASE)
+                if match:
+                    try:
+                        garage_num = int(match.group(1))
+                        if 0 <= garage_num <= 10:
+                            details['garage_spaces'] = garage_num
+                            break
+                    except (ValueError, IndexError):
+                        continue
+            
+            # Count images
+            img_elements = soup.find_all('img', src=re.compile(r'photo.*redfin', re.IGNORECASE))
+            details['total_images'] = max(len(img_elements), 1)
+            
+            # Extract days on market
+            dom_patterns = [
+                r'"dom"[:\s]*[{\[]*"value"[:\s]*(\d+)',
+                r'(\d+)\s*days?\s*on\s*market'
+            ]
+            for pattern in dom_patterns:
+                match = re.search(pattern, page_text, re.IGNORECASE)
+                if match:
+                    try:
+                        dom = int(match.group(1))
+                        if 0 <= dom <= 2000:
+                            details['days_on_market'] = dom
+                            break
+                    except (ValueError, IndexError):
+                        continue
+            
+            return details
+            
+        except Exception as e:
+            logger.error(f"Detail extraction failed for {detail_url}: {e}")
+            return {}
+    
+    
+#!/usr/bin/env python3
+"""California Real Estate Mega Scraper - Complete Production Version"""
+
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import time
+import re
+import random
+import json
+import logging
+import os
+import pickle
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+import sys
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f'scraping_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class CaliforniaRealEstateScraper:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1"
+        })
+        self.scraped_urls = set()
+        self.all_listings = []
+        self.current_city_index = 0
+        self.failed_urls = set()
+        self.stats = {
+            'total_requests': 0,
+            'successful_requests': 0,
+            'failed_requests': 0,
+            'rate_limit_hits': 0
+        }
+        Path('data').mkdir(exist_ok=True)
+        Path('logs').mkdir(exist_ok=True)
+    
+    def make_request_with_retry(self, url, max_retries=3):
+        """Make HTTP request with comprehensive retry logic"""
+        for attempt in range(max_retries + 1):
+            try:
+                self.stats['total_requests'] += 1
+                time.sleep(random.uniform(3, 8))
+                
+                response = self.session.get(url, timeout=30)
+                
+                if response.status_code == 200:
+                    self.stats['successful_requests'] += 1
+                    return response
+                elif response.status_code == 429:
+                    self.stats['rate_limit_hits'] += 1
+                    wait_time = min((2 ** attempt) * 60, 1800)  # Max 30 min
+                    logger.warning(f"Rate limited! Waiting {wait_time//60}m {wait_time%60}s...")
+                    time.sleep(wait_time)
+                    continue
+                elif response.status_code in [403, 503, 504]:
+                    wait_time = min(300 + (attempt * 60), 900)
+                    logger.warning(f"Server error {response.status_code}. Waiting {wait_time//60}m...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.warning(f"HTTP {response.status_code} for {url} (attempt {attempt + 1})")
+                
+                if attempt < max_retries:
+                    time.sleep(random.uniform(15, 45))
+                    
+            except requests.exceptions.Timeout:
+                logger.warning(f"Timeout for {url} (attempt {attempt + 1})")
+                if attempt < max_retries:
+                    time.sleep(random.uniform(20, 40))
+            except requests.exceptions.ConnectionError as e:
+                logger.warning(f"Connection error: {e}")
+                if attempt < max_retries:
+                    time.sleep(random.uniform(30, 60))
+            except Exception as e:
+                logger.error(f"Unexpected error: {e}")
+                if attempt < max_retries:
+                    time.sleep(random.uniform(25, 50))
+        
+        self.stats['failed_requests'] += 1
+        self.failed_urls.add(url)
+        return None
+    
+    def extract_listing_details(self, detail_url):
+        """Extract comprehensive listing details"""
+        try:
+            response = self.make_request_with_retry(detail_url)
+            if not response:
+                return {}
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            details = {}
+            page_text = soup.get_text()
+            
+            # Extract description from JavaScript
+            scripts = soup.find_all('script')
+            for script in scripts:
+                script_content = script.string or ''
+                if 'listingRemarks' in script_content:
+                    match = re.search(r'"listingRemarks":\s*"([^"]*)"', script_content)
+                    if match:
+                        desc = match.group(1)
+                        desc = desc.replace('\\n', ' ').replace('\\"', '"').replace('\\/', '/')
+                        desc = desc.replace('\\u0026', '&').replace('\\u0027', "'")
+                        if len(desc) > 50:
+                            details['full_description'] = desc[:2000]
+                            break
+            
+            # Extract year built
+            year_patterns = [
+                r'"yearBuilt"[:\s]*(\d{4})',
+                r'Built[:\s]*in[:\s]*(\d{4})',
+                r'Year Built[:\s]*(\d{4})'
+            ]
+            for pattern in year_patterns:
+                match = re.search(pattern, page_text, re.IGNORECASE)
+                if match:
+                    year = int(match.group(1))
+                    if 1800 <= year <= 2030:
+                        details['year_built'] = year
+                        break
+            
+            # Property type detection
+            url_lower = detail_url.lower()
+            page_lower = page_text.lower()
+            
+            if '/unit-' in url_lower or 'condo' in url_lower or 'condominium' in page_lower:
+                details['property_type'] = 'Condo'
+            elif 'townhome' in url_lower or 'townhouse' in page_lower:
+                details['property_type'] = 'Townhome'
+            elif 'mobile' in page_lower or 'manufactured' in page_lower:
+                details['property_type'] = 'Mobile Home'
+            elif 'multi' in page_lower and 'family' in page_lower:
+                details['property_type'] = 'Multi-Family'
+            else:
+                details['property_type'] = 'Single Family'
+            
+            # Extract lot size
+            lot_patterns = [
+                r'"lotSize"[:\s]*[{\[]*"value"[:\s]*([0-9,]+)',
+                r'Lot Size[:\s]*([0-9,]+(?:\.[0-9]+)?)\s*(?:sq\.?\s?ft|sqft)',
+                r'([0-9,]+(?:\.[0-9]+)?)\s*(?:sq\.?\s?ft|sqft)\s*lot'
+            ]
+            for pattern in lot_patterns:
+                match = re.search(pattern, page_text, re.IGNORECASE)
+                if match:
+                    try:
+                        lot_size = float(match.group(1).replace(',', ''))
+                        if 100 <= lot_size <= 1000000:
+                            details['lot_size_sqft'] = lot_size
+                            break
+                    except (ValueError, IndexError):
+                        continue
+            
+            # Extract HOA fees
+            hoa_patterns = [
+                r'"hoa"[:\s]*[{\[]*"value"[:\s]*([0-9,]+)',
+                r'HOA[:\s]*[\$]?([0-9,]+)',
+                r'Association[:\s]*Fee[:\s]*[\$]?([0-9,]+)'
+            ]
+            for pattern in hoa_patterns:
+                match = re.search(pattern, page_text, re.IGNORECASE)
+                if match:
+                    try:
+                        hoa_fee = float(match.group(1).replace(',', ''))
+                        if 0 < hoa_fee < 5000:
+                            details['hoa_monthly_fee'] = hoa_fee
+                            break
+                    except (ValueError, IndexError):
+                        continue
+            
+            # Extract garage spaces
+            garage_patterns = [
+                r'(\d+)[:\s]*(?:car\s*)?garage',
+                r'garage[:\s]*(\d+)',
+                r'"garageSpaces"[:\s]*(\d+)'
+            ]
+            for pattern in garage_patterns:
+                match = re.search(pattern, page_text, re.IGNORECASE)
+                if match:
+                    try:
+                        garage_num = int(match.group(1))
+                        if 0 <= garage_num <= 10:
+                            details['garage_spaces'] = garage_num
+                            break
+                    except (ValueError, IndexError):
+                        continue
+            
+            # Count images
+            img_elements = soup.find_all('img', src=re.compile(r'photo.*redfin', re.IGNORECASE))
+            details['total_images'] = max(len(img_elements), 1)
+            
+            # Extract days on market
+            dom_patterns = [
+                r'"dom"[:\s]*[{\[]*"value"[:\s]*(\d+)',
+                r'(\d+)\s*days?\s*on\s*market'
+            ]
+            for pattern in dom_patterns:
+                match = re.search(pattern, page_text, re.IGNORECASE)
+                if match:
+                    try:
+                        dom = int(match.group(1))
+                        if 0 <= dom <= 2000:
+                            details['days_on_market'] = dom
+                            break
+                    except (ValueError, IndexError):
+                        continue
+            
+            return details
+            
+        except Exception as e:
+            logger.error(f"Detail extraction failed for {detail_url}: {e}")
+            return {}
+    
+    def validate_listing_data(self, listing_data):
+        """Validate listing data quality"""
+        try:
+            # Required fields check
+            required_fields = ['Price', 'Address', 'Details Link']
+            for field in required_fields:
+                if field not in listing_data or not listing_data[field] or listing_data[field] == 'N/A':
+                    return False
+            
+            # Price validation
+            price = listing_data.get('Price', '')
+            if not re.search(r'\d', price):
+                return False
+            
+            # Address validation
+            address = listing_data.get('Address', '')
+            if len(address) < 5:
+                return False
+            
+            # URL validation
+            detail_link = listing_data.get('Details Link', '')
+            if not detail_link.startswith('https://www.redfin.com/'):
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.debug(f"Validation error: {e}")
+            return False
+
+    def scrape_city_listings(self, city_info, pages_per_city=25):
+        """Scrape all listings for a single city"""
+        city_name = city_info['name']
+        city_url = city_info['url']
+        
+        logger.info(f"🏙️ Starting {city_name} - targeting {pages_per_city} pages")
+        
+        city_listings = []
+        consecutive_empty_pages = 0
+        max_empty_pages = 10
+        
+        for page in range(1, pages_per_city + 1):
+            try:
+                page_url = f"{city_url}/page-{page}" if page > 1 else city_url
+                
+                response = self.make_request_with_retry(page_url)
+                if not response:
+                    logger.warning(f"Failed to fetch page {page} for {city_name}")
+                    consecutive_empty_pages += 1
+                    if consecutive_empty_pages >= max_empty_pages:
+                        break
+                    continue
+                
+                soup = BeautifulSoup(response.content, "html.parser")
+                
+                # Try multiple selectors for listing containers
+                containers = (
+                    soup.find_all("div", class_="HomeCardContainer") or
+                    soup.find_all("div", class_="SearchResult") or
+                    soup.find_all("div", {"data-testid": re.compile(r"property|listing", re.IGNORECASE)})
+                )
+                
+                logger.info(f"  📄 Page {page}: {len(containers)} listings found")
+                
+                if not containers:
+                    consecutive_empty_pages += 1
+                    if consecutive_empty_pages >= max_empty_pages:
+                        logger.info(f"No more listings found for {city_name}")
+                        break
+                    continue
+                else:
+                    consecutive_empty_pages = 0
+                
+                page_valid_listings = 0
+                
+                for listing_elem in containers:
+                    try:
+                        # Extract basic listing information
+                        price_elem = listing_elem.find("span", class_=re.compile(r"Price", re.IGNORECASE))
+                        price = price_elem.get_text(strip=True) if price_elem else "N/A"
+                        
+                        address_elem = listing_elem.find("div", class_=re.compile(r"Address", re.IGNORECASE))
+                        address = address_elem.get_text(strip=True) if address_elem else "N/A"
+                        
+                        beds_elem = listing_elem.find("span", class_=re.compile(r"beds", re.IGNORECASE))
+                        beds = beds_elem.get_text(strip=True) if beds_elem else "N/A"
+                        
+                        baths_elem = listing_elem.find("span", class_=re.compile(r"baths", re.IGNORECASE))
+                        baths = baths_elem.get_text(strip=True) if baths_elem else "N/A"
+                        
+                        sqft_elem = listing_elem.find("span", class_=re.compile(r"sqft|sq-ft", re.IGNORECASE))
+                        sqft = sqft_elem.get_text(strip=True) if sqft_elem else "N/A"
+                        
+                        # Get detail link
+                        link_elem = listing_elem.find("a", href=True)
+                        if not link_elem:
+                            continue
+                        
+                        href = link_elem['href']
+                        if href.startswith('/'):
+                            details_link = f"https://www.redfin.com{href}"
+                        else:
+                            details_link = href
+                        
+                        # Skip if already processed
+                        if details_link in self.scraped_urls:
+                            continue
+                        
+                        # Create listing data
+                        listing_data = {
+                            "Price": price,
+                            "Address": address,
+                            "Beds": beds,
+                            "Baths": baths,
+                            "Sq Ft": sqft,
+                            "Details Link": details_link,
+                            "City": city_name,
+                            "State": "CA",
+                            "Scraped_At": datetime.now().isoformat()
+                        }
+                        
+                        # Validate listing data
+                        if self.validate_listing_data(listing_data):
+                            self.scraped_urls.add(details_link)
+                            city_listings.append(listing_data)
+                            page_valid_listings += 1
+                        
+                    except Exception as e:
+                        logger.warning(f"Error processing listing in {city_name}: {e}")
+                        continue
+                
+                logger.info(f"  ✅ Page {page}: {page_valid_listings} valid listings added")
+                
+            except Exception as e:
+                logger.error(f"Error on page {page} for {city_name}: {e}")
+                consecutive_empty_pages += 1
+                if consecutive_empty_pages >= max_empty_pages:
+                    break
+                continue
+        
+        logger.info(f"✅ {city_name} complete: {len(city_listings)} listings collected")
+        # Add debug info for potential caps
+        if len(city_listings) >= 340:
+            logger.warning(f"🚨 {city_name}: Hit {len(city_listings)} listings - likely capped!")
+            logger.warning(f"    Consider increasing pages_per_city beyond {pages_per_city}")
+        return city_listings
+
+    def save_checkpoint(self, timestamp):
+        """Save comprehensive checkpoint"""
+        try:
+            checkpoint = {
+                'timestamp': timestamp,
+                'current_city_index': self.current_city_index,
+                'scraped_urls': list(self.scraped_urls),
+                'failed_urls': list(self.failed_urls),
+                'all_listings': self.all_listings,
+                'stats': self.stats
+            }
+            
+            checkpoint_file = f"data/checkpoint_{timestamp}.pkl"
+            
+            with open(checkpoint_file, 'wb') as f:
+                pickle.dump(checkpoint, f, protocol=pickle.HIGHEST_PROTOCOL)
+            
+            # Also save JSON backup (without listings to avoid size issues)
+            checkpoint_json = checkpoint.copy()
+            checkpoint_json['all_listings'] = len(checkpoint_json['all_listings'])
+            
+            json_file = f"data/checkpoint_{timestamp}.json"
+            with open(json_file, 'w') as f:
+                json.dump(checkpoint_json, f, indent=2, default=str)
+            
+            logger.info(f"💾 Checkpoint saved: {checkpoint_file} ({len(self.all_listings)} listings)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to save checkpoint: {e}")
+            return False
+    
+    def load_checkpoint(self, checkpoint_file):
+        """Load checkpoint with error handling"""
+        try:
+            if not os.path.exists(checkpoint_file):
+                return False
+            
+            with open(checkpoint_file, 'rb') as f:
+                checkpoint = pickle.load(f)
+            
+            self.current_city_index = checkpoint.get('current_city_index', 0)
+            self.scraped_urls = set(checkpoint.get('scraped_urls', []))
+            self.failed_urls = set(checkpoint.get('failed_urls', []))
+            self.all_listings = checkpoint.get('all_listings', [])
+            self.stats = checkpoint.get('stats', self.stats)
+            
+            logger.info(f"📂 Checkpoint loaded: {len(self.all_listings)} listings, city {self.current_city_index}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            return False
+    
+    def find_latest_checkpoint(self):
+        """Find most recent checkpoint"""
+        try:
+            data_dir = Path('data')
+            checkpoint_files = list(data_dir.glob('checkpoint_*.pkl'))
+            
+            if checkpoint_files:
+                latest = max(checkpoint_files, key=lambda p: p.stat().st_mtime)
+                return str(latest)
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error finding checkpoint: {e}")
+            return None
+
+    def enrich_with_details(self, listings_df, batch_size=50):
+        """Add detailed information using threading"""
+        logger.info(f"🔍 Enriching {len(listings_df)} listings with details")
+        enriched_listings = []
+        
+        for i in range(0, len(listings_df), batch_size):
+            batch = listings_df.iloc[i:i+batch_size]
+            batch_num = i // batch_size + 1
+            total_batches = (len(listings_df) // batch_size) + 1
+            
+            logger.info(f"📦 Processing batch {batch_num}/{total_batches} ({len(batch)} listings)")
+            
+            batch_enriched = []
+            
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_to_listing = {
+                    executor.submit(self.extract_listing_details, row['Details Link']): row 
+                    for _, row in batch.iterrows()
+                }
+                
+                for future in as_completed(future_to_listing):
+                    listing = future_to_listing[future]
+                    try:
+                        details = future.result()
+                        enriched = {**listing, **details}
+                        batch_enriched.append(enriched)
+                        
+                    except Exception as e:
+                        logger.warning(f"Failed to get details: {e}")
+                        batch_enriched.append(listing)  # Keep basic data
+            
+            enriched_listings.extend(batch_enriched)
+            logger.info(f"✅ Batch {batch_num} complete. Total enriched: {len(enriched_listings)}")
+            
+            # Save batch progress
+            if batch_num % 5 == 0:
+                progress_df = pd.DataFrame(enriched_listings)
+                progress_file = f"data/enriched_progress_batch_{batch_num}.csv"
+                progress_df.to_csv(progress_file, index=False)
+            
+            time.sleep(random.uniform(30, 60))
+        
+        return pd.DataFrame(enriched_listings)
+
+    def run_campaign(self, cities_config, pages_per_city=100, resume=True):
+        """Execute the comprehensive scraping campaign"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        logger.info("🚀 CALIFORNIA REAL ESTATE MEGA SCRAPING CAMPAIGN")
+        logger.info("=" * 70)
+        logger.info(f"🎯 Target Cities: {len(cities_config)}")
+        logger.info(f"📊 Estimated Listings: {len(cities_config) * pages_per_city * 20:,}")
+        logger.info(f"⏱️ Estimated Runtime: {len(cities_config) * 0.3:.1f} hours")
+        logger.info("=" * 70)
+        
+        try:
+            # Check for existing checkpoint
+            if resume:
+                latest_checkpoint = self.find_latest_checkpoint()
+                if latest_checkpoint:
+                    logger.info(f"🔄 Found checkpoint: {latest_checkpoint}")
+                    if self.load_checkpoint(latest_checkpoint):
+                        logger.info(f"📍 Resuming from city index {self.current_city_index}")
+            
+            # Phase 1: Basic listings collection
+            logger.info(f"\n🏃‍♂️ PHASE 1: BASIC LISTINGS COLLECTION")
+            logger.info(f"Starting from city {self.current_city_index + 1}/{len(cities_config)}")
+            
+            for i in range(self.current_city_index, len(cities_config)):
+                try:
+                    city_info = cities_config[i]
+                    self.current_city_index = i
+                    
+                    logger.info(f"\n🎯 City {i + 1}/{len(cities_config)}: {city_info['name']}")
+                    
+                    # Scrape this city
+                    city_listings = self.scrape_city_listings(city_info, pages_per_city)
+                    self.all_listings.extend(city_listings)
+                    
+                    # Save checkpoint every 3 cities
+                    if (i + 1) % 3 == 0:
+                        self.save_checkpoint(timestamp)
+                    
+                    # Save progress CSV
+                    if self.all_listings and (i + 1) % 2 == 0:
+                        progress_df = pd.DataFrame(self.all_listings)
+                        progress_file = f"data/progress_after_{i + 1}_cities_{timestamp}.csv"
+                        progress_df.to_csv(progress_file, index=False)
+                        logger.info(f"📊 Progress saved: {len(progress_df)} listings")
+                    
+                    logger.info(f"📈 Total collected so far: {len(self.all_listings):,} listings")
+                    
+                    # Log current stats
+                    logger.info(f"📊 Session stats: {self.stats['successful_requests']} successful, "
+                               f"{self.stats['failed_requests']} failed, "
+                               f"{self.stats['rate_limit_hits']} rate limits")
+                    
+                    # Longer delay between cities
+                    time.sleep(random.uniform(20, 40))
+                    
+                except KeyboardInterrupt:
+                    logger.info("⚠️ Interrupted by user. Saving checkpoint...")
+                    self.save_checkpoint(timestamp)
+                    break
+                except Exception as e:
+                    logger.error(f"Failed to scrape {cities_config[i]['name']}: {e}")
+                    continue
+            
+            if not self.all_listings:
+                logger.error("❌ No listings collected!")
+                return None
+            
+            # Save basic listings
+            basic_df = pd.DataFrame(self.all_listings)
+            basic_df = basic_df.drop_duplicates(subset=['Details Link'])
+            basic_file = f"data/california_basic_listings_{timestamp}.csv"
+            basic_df.to_csv(basic_file, index=False)
+            
+            logger.info(f"\n✅ PHASE 1 COMPLETE")
+            logger.info(f"📊 Collected: {len(basic_df)} unique basic listings")
+            logger.info(f"💾 Saved: {basic_file}")
+            
+            # Phase 2: Detail enrichment
+            logger.info(f"\n🔍 PHASE 2: DETAIL ENRICHMENT")
+            logger.info(f"⚠️ This will take several hours for {len(basic_df)} listings...")
+            
+            enriched_df = self.enrich_with_details(basic_df, batch_size=100)
+            
+            # Final cleanup and save
+            final_df = enriched_df.drop_duplicates(subset=['Details Link'])
+            final_file = f"data/california_real_estate_final_{timestamp}.csv"
+            final_df.to_csv(final_file, index=False)
+            
+            logger.info(f"\n🎉 CAMPAIGN COMPLETE!")
+            logger.info(f"📊 Final dataset: {len(final_df):,} unique listings")
+            logger.info(f"🏙️ Cities covered: {final_df['City'].nunique()}")
+            logger.info(f"💾 Final file: {final_file}")
+            
+            # Generate quality report
+            self.generate_quality_report(final_df)
+            
+            return final_df
+            
+        except Exception as e:
+            logger.error(f"Campaign failed with error: {e}")
+            self.save_checkpoint(timestamp)
+            return None
+
+    def generate_quality_report(self, df):
+        """Generate comprehensive data quality report"""
+        logger.info(f"\n📈 DATA QUALITY REPORT:")
+        
+        try:
+            # Basic stats
+            logger.info(f"  Total unique listings: {len(df):,}")
+            logger.info(f"  Cities covered: {df['City'].nunique()}")
+            logger.info(f"  States covered: {df['State'].nunique()}")
+            
+            # Price analysis
+            df['Price_Numeric'] = pd.to_numeric(
+                df['Price'].str.replace(r'[\$,]', '', regex=True), 
+                errors='coerce'
+            )
+            valid_prices = df['Price_Numeric'].dropna()
+            
+            if len(valid_prices) > 0:
+                logger.info(f"  Price range: ${valid_prices.min():,.0f} - ${valid_prices.max():,.0f}")
+                logger.info(f"  Median price: ${valid_prices.median():,.0f}")
+                logger.info(f"  Average price: ${valid_prices.mean():,.0f}")
+            
+            # Data completeness analysis
+            key_fields = [
+                'full_description', 'year_built', 'property_type', 
+                'total_images', 'lot_size_sqft', 'hoa_monthly_fee', 
+                'garage_spaces', 'days_on_market'
+            ]
+            
+            logger.info(f"  Data completeness:")
+            for field in key_fields:
+                if field in df.columns:
+                    valid_count = df[field].notna().sum()
+                    percentage = (valid_count / len(df)) * 100
+                    logger.info(f"    {field}: {valid_count:,}/{len(df):,} ({percentage:.1f}%)")
+            
+            # Top cities by listing count
+            top_cities = df['City'].value_counts().head(10)
+            logger.info(f"  Top 10 cities by listings:")
+            for city, count in top_cities.items():
+                logger.info(f"    {city}: {count:,} listings")
+            
+            # Property type distribution
+            if 'property_type' in df.columns:
+                prop_types = df['property_type'].value_counts()
+                logger.info(f"  Property types:")
+                for prop_type, count in prop_types.items():
+                    percentage = (count / len(df)) * 100
+                    logger.info(f"    {prop_type}: {count:,} ({percentage:.1f}%)")
+            
+        except Exception as e:
+            logger.error(f"Error generating quality report: {e}")
+
+# REVISED CALIFORNIA CITIES - FOCUS ON HIGH VOLUME + MARKET DIVERSITY
+# Removing low-volume cities, keeping representative sample
+CALIFORNIA_CITIES_MEGA = [
+    # ====== HIGH-VOLUME LUXURY MARKETS ($1M+) ======
+    {'name': 'Beverly Hills', 'url': 'https://www.redfin.com/city/1669/CA/Beverly-Hills'},
+    {'name': 'Manhattan Beach', 'url': 'https://www.redfin.com/city/11576/CA/Manhattan-Beach'},
+    {'name': 'Los Altos', 'url': 'https://www.redfin.com/city/11018/CA/Los-Altos'},
+    {'name': 'Newport Beach', 'url': 'https://www.redfin.com/city/13193/CA/Newport-Beach'},
+    
+    # ====== HIGH-VOLUME TECH HUBS ($800K-$2M) ======
+    {'name': 'Fremont', 'url': 'https://www.redfin.com/city/6671/CA/Fremont'},
+    {'name': 'Santa Clara', 'url': 'https://www.redfin.com/city/17675/CA/Santa-Clara'},
+    {'name': 'Cupertino', 'url': 'https://www.redfin.com/city/4561/CA/Cupertino'},
+    {'name': 'Milpitas', 'url': 'https://www.redfin.com/city/12204/CA/Milpitas'},
+    {'name': 'San Mateo', 'url': 'https://www.redfin.com/city/17490/CA/San-Mateo'},
+    {'name': 'Pleasanton', 'url': 'https://www.redfin.com/city/14986/CA/Pleasanton'},
+    
+    # ====== HIGH-VOLUME COASTAL PREMIUM ($700K-$1.5M) ======
+    {'name': 'Huntington Beach', 'url': 'https://www.redfin.com/city/9164/CA/Huntington-Beach'},
+    {'name': 'Irvine', 'url': 'https://www.redfin.com/city/9361/CA/Irvine'},
+    {'name': 'Carlsbad', 'url': 'https://www.redfin.com/city/2891/CA/Carlsbad'},
+    {'name': 'Santa Barbara', 'url': 'https://www.redfin.com/city/17669/CA/Santa-Barbara'},
+    
+    # ====== HIGH-VOLUME SUBURBAN ($500K-$900K) ======
+    {'name': 'Pasadena', 'url': 'https://www.redfin.com/city/14498/CA/Pasadena'},
+    {'name': 'Berkeley', 'url': 'https://www.redfin.com/city/1590/CA/Berkeley'},
+    {'name': 'Walnut Creek', 'url': 'https://www.redfin.com/city/20635/CA/Walnut-Creek'},
+    {'name': 'Chula Vista', 'url': 'https://www.redfin.com/city/3494/CA/Chula-Vista'},
+    {'name': 'Thousand Oaks', 'url': 'https://www.redfin.com/city/19798/CA/Thousand-Oaks'},
+    {'name': 'Mission Viejo', 'url': 'https://www.redfin.com/city/12331/CA/Mission-Viejo'},
+    
+    # ====== HIGH-VOLUME MIDDLE-CLASS ($400K-$700K) ======
+    {'name': 'Oceanside', 'url': 'https://www.redfin.com/city/13753/CA/Oceanside'},
+    {'name': 'Escondido', 'url': 'https://www.redfin.com/city/5876/CA/Escondido'},
+    {'name': 'Riverside', 'url': 'https://www.redfin.com/city/15935/CA/Riverside'},
+    {'name': 'Rancho Cucamonga', 'url': 'https://www.redfin.com/city/15390/CA/Rancho-Cucamonga'},
+    {'name': 'Santa Ana', 'url': 'https://www.redfin.com/city/17650/CA/Santa-Ana'},
+    {'name': 'Anaheim', 'url': 'https://www.redfin.com/city/517/CA/Anaheim'},
+    {'name': 'Concord', 'url': 'https://www.redfin.com/city/4150/CA/Concord'},
+    {'name': 'Hayward', 'url': 'https://www.redfin.com/city/8439/CA/Hayward'},
+    
+    # ====== HIGH-VOLUME AFFORDABLE ($250K-$500K) ======
+    {'name': 'Bakersfield', 'url': 'https://www.redfin.com/city/953/CA/Bakersfield'},
+    {'name': 'San Bernardino', 'url': 'https://www.redfin.com/city/16659/CA/San-Bernardino'},
+    {'name': 'Moreno Valley', 'url': 'https://www.redfin.com/city/12621/CA/Moreno-Valley'},
+    {'name': 'Fontana', 'url': 'https://www.redfin.com/city/6354/CA/Fontana'},
+    {'name': 'Lancaster', 'url': 'https://www.redfin.com/city/10233/CA/Lancaster'},
+    {'name': 'Palmdale', 'url': 'https://www.redfin.com/city/14292/CA/Palmdale'},
+    {'name': 'Richmond', 'url': 'https://www.redfin.com/city/15629/CA/Richmond'},
+    {'name': 'Antioch', 'url': 'https://www.redfin.com/city/588/CA/Antioch'},
+    {'name': 'Fairfield', 'url': 'https://www.redfin.com/city/5980/CA/Fairfield'},
+    {'name': 'Tracy', 'url': 'https://www.redfin.com/city/20144/CA/Tracy'},
+    {'name': 'Visalia', 'url': 'https://www.redfin.com/city/20572/CA/Visalia'},
+    
+    # ====== ADDITIONAL HIGH-VOLUME MARKETS ======
+    {'name': 'Garden Grove', 'url': 'https://www.redfin.com/city/7381/CA/Garden-Grove'},
+    {'name': 'Ontario', 'url': 'https://www.redfin.com/city/13934/CA/Ontario'},
+    {'name': 'Corona', 'url': 'https://www.redfin.com/city/4249/CA/Corona'},
+    {'name': 'Oxnard', 'url': 'https://www.redfin.com/city/14141/CA/Oxnard'},
+    {'name': 'Ventura', 'url': 'https://www.redfin.com/city/16678/CA/Ventura'},
+    {'name': 'Vacaville', 'url': 'https://www.redfin.com/city/20361/CA/Vacaville'},
+    {'name': 'Turlock', 'url': 'https://www.redfin.com/city/20251/CA/Turlock'},
+    
+    # ====== SPECIALTY MARKETS (High-volume resort/retirement) ======
+    {'name': 'Palm Springs', 'url': 'https://www.redfin.com/city/14315/CA/Palm-Springs'},
+    {'name': 'Napa', 'url': 'https://www.redfin.com/city/12914/CA/Napa'},
+    {'name': 'Davis', 'url': 'https://www.redfin.com/city/4690/CA/Davis'},
+]
+
+def main():
+    """Main execution function with OPTIMIZED configuration"""
+    print("🚀 CALIFORNIA REAL ESTATE HIGH-VOLUME SCRAPING")
+    print("=" * 70)
+    print(f"🎯 Target: {len(CALIFORNIA_CITIES_MEGA)} high-volume California cities")
+    print(f"📊 Estimated listings: 4,000-6,000")
+    print("⏱️ Estimated runtime: 6-8 hours")
+    print("💾 All progress automatically saved")
+    print("🔄 Fully resumable if interrupted")
+    print("=" * 70)
+    
+    # OPTIMIZED CONFIGURATION
+    config = {
+        'pages_per_city': 15,        # INCREASED from 40
+        'resume_from_checkpoint': True,
+        'batch_size_enrichment': 50,  # REDUCED from 100 to avoid timeouts
+        'max_workers_threading': 1,   # REDUCED from 2 to avoid rate limits
+        'save_progress_every_n_cities': 1,  # INCREASED frequency
+        
+        # NEW SETTINGS FOR BETTER SUCCESS RATE
+        'delay_between_pages': 2,     # Add delay between page requests
+        'delay_between_cities': 8,    # Add delay between cities
+        'timeout_per_request': 30,    # Increase timeout
+        'max_retries': 3,            # Retry failed requests
+    }
+    
+    print(f"📋 Configuration:")
+    for key, value in config.items():
+        print(f"  {key}: {value}")
+    print()
+    
+    # Initialize scraper
+    scraper = CaliforniaRealEstateScraper()
+    
+    try:
+        # Run the campaign
+        final_dataset = scraper.run_campaign(
+            cities_config=CALIFORNIA_CITIES_MEGA,
+            pages_per_city=config['pages_per_city'],
+            resume=config['resume_from_checkpoint']
+        )
+        
+        if final_dataset is not None:
+            print(f"\n🎉 CAMPAIGN COMPLETED SUCCESSFULLY!")
+            print("=" * 50)
+            print(f"📊 Final Results:")
+            print(f"  Total listings: {len(final_dataset):,}")
+            print(f"  Cities covered: {final_dataset['City'].nunique()}")
+            print(f"  Unique property types: {final_dataset.get('property_type', pd.Series()).nunique()}")
+            
+            # Price analysis
+            try:
+                prices = pd.to_numeric(
+                    final_dataset['Price'].str.replace(r'[\$,]', '', regex=True), 
+                    errors='coerce'
+                ).dropna()
+                
+                if len(prices) > 0:
+                    print(f"  Price range: ${prices.min():,.0f} - ${prices.max():,.0f}")
+                    print(f"  Median price: ${prices.median():,.0f}")
+            except:
+                pass
+            
+            print(f"\n💾 Files created:")
+            print(f"  📁 data/california_real_estate_final_*.csv (main dataset)")
+            print(f"  📁 data/california_basic_listings_*.csv (basic data)")
+            print(f"  📁 data/progress_*.csv (progress checkpoints)")
+            print(f"  📁 logs/scraping_*.log (detailed logs)")
+            
+            print(f"\n🚀 Ready for ML modeling!")
+            print(f"This dataset contains {len(final_dataset):,} California real estate listings")
+            print(f"with rich features including descriptions, property types, and market data.")
+            
+        else:
+            print("\n❌ Campaign failed - check logs for details")
+            print("💡 You can restart to resume from the last checkpoint")
+            
+    except KeyboardInterrupt:
+        print("\n⚠️ Campaign interrupted by user")
+        print("💾 All progress has been automatically saved")
+        print("🔄 Run the script again to resume from where you left off")
+        
+    except Exception as e:
+        print(f"\n❌ Campaign failed with error: {e}")
+        print("📋 Check the log files in the 'logs' directory for detailed error information")
+        print("💾 Progress has been saved - you can restart to resume")
+        
+    finally:
+        # Cleanup and final statistics
+        try:
+            scraper.generate_quality_report(pd.DataFrame(scraper.all_listings))
+        except:
+            pass
+
+def quick_test_run():
+    """Quick test with just a few cities for testing purposes"""
+    print("🧪 QUICK TEST RUN - 3 cities only")
+    
+    test_cities = CALIFORNIA_CITIES_MEGA[:3]  # Just first 3 cities
+    
+    scraper = CaliforniaRealEstateScraper()
+    
+    result = scraper.run_campaign(
+        cities_config=test_cities,
+        pages_per_city=5,  # Just 5 pages per city
+        resume=True
+    )
+    
+    if result is not None:
+        print(f"✅ Test completed: {len(result)} listings collected")
+    else:
+        print("❌ Test failed")
+
+def resume_campaign():
+    """Resume a previously interrupted campaign"""
+    print("🔄 RESUMING PREVIOUS CAMPAIGN")
+    
+    scraper = CaliforniaRealEstateScraper()
+    
+    # Find and load latest checkpoint
+    latest_checkpoint = scraper.find_latest_checkpoint()
+    if latest_checkpoint:
+        print(f"📂 Found checkpoint: {latest_checkpoint}")
+        if scraper.load_checkpoint(latest_checkpoint):
+            print(f"✅ Resuming from city {scraper.current_city_index + 1}")
+            print(f"📊 {len(scraper.all_listings)} listings already collected")
+            
+            # Continue the campaign
+            result = scraper.run_campaign(
+                cities_config=CALIFORNIA_CITIES_MEGA,
+                pages_per_city=30,
+                resume=True
+            )
+            
+            if result is not None:
+                print(f"🎉 Campaign completed: {len(result)} total listings")
+        else:
+            print("❌ Failed to load checkpoint")
+    else:
+        print("❌ No checkpoint found - starting fresh campaign")
+        main()
+
+# Command-line interface
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1:
+        command = sys.argv[1].lower()
+        
+        if command == "test":
+            quick_test_run()
+        elif command == "resume":
+            resume_campaign()
+        elif command == "main" or command == "full":
+            main()
+        else:
+            print("Usage:")
+            print("  python scraper.py          # Run full campaign")
+            print("  python scraper.py main     # Run full campaign") 
+            print("  python scraper.py test     # Quick test (3 cities)")
+            print("  python scraper.py resume   # Resume interrupted campaign")
+    else:
+        # Default: run full campaign
+        main()
+
+# OPTIONAL: Additional utility functions you can add
+
+def analyze_existing_data(csv_file_path):
+    """Analyze an existing dataset"""
+    try:
+        df = pd.read_csv(csv_file_path)
+        print(f"📊 Dataset Analysis: {csv_file_path}")
+        print(f"  Total listings: {len(df):,}")
+        print(f"  Columns: {len(df.columns)}")
+        print(f"  Cities: {df['City'].nunique() if 'City' in df.columns else 'N/A'}")
+        
+        if 'Price' in df.columns:
+            prices = pd.to_numeric(df['Price'].str.replace(r'[\$,]', '', regex=True), errors='coerce')
+            valid_prices = prices.dropna()
+            if len(valid_prices) > 0:
+                print(f"  Price range: ${valid_prices.min():,.0f} - ${valid_prices.max():,.0f}")
+                print(f"  Median price: ${valid_prices.median():,.0f}")
+        
+        print(f"  Sample columns: {list(df.columns)[:10]}")
+        
+    except Exception as e:
+        print(f"❌ Error analyzing data: {e}")
+
+def combine_datasets(*csv_files):
+    """Combine multiple CSV files into one"""
+    try:
+        all_dfs = []
+        for file_path in csv_files:
+            df = pd.read_csv(file_path)
+            all_dfs.append(df)
+            print(f"📁 Loaded {len(df)} listings from {file_path}")
+        
+        combined_df = pd.concat(all_dfs, ignore_index=True)
+        combined_df = combined_df.drop_duplicates(subset=['Details Link'] if 'Details Link' in combined_df.columns else None)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = f"data/combined_california_listings_{timestamp}.csv"
+        combined_df.to_csv(output_file, index=False)
+        
+        print(f"✅ Combined dataset saved: {output_file}")
+        print(f"📊 Total unique listings: {len(combined_df):,}")
+        
+        return output_file
+        
+    except Exception as e:
+        print(f"❌ Error combining datasets: {e}")
+        return None
+
+# Configuration for different run modes
+RUN_CONFIGURATIONS = {
+    'quick': {
+        'cities': CALIFORNIA_CITIES_MEGA[:5],
+        'pages_per_city': 10,
+        'description': 'Quick test with 5 cities, 10 pages each (~1000 listings)'
+    },
+    'medium': {
+        'cities': CALIFORNIA_CITIES_MEGA[:20],
+        'pages_per_city': 20,
+        'description': 'Medium run with 20 cities, 20 pages each (~8000 listings)'
+    },
+    'full': {
+        'cities': CALIFORNIA_CITIES_MEGA,
+        'pages_per_city': 30,
+        'description': 'Full campaign - all cities, 30 pages each (~25000+ listings)'
+    },
+    'mega': {
+        'cities': CALIFORNIA_CITIES_MEGA,
+        'pages_per_city': 50,
+        'description': 'Mega campaign - all cities, 50 pages each (~50000+ listings)'
+    }
+}
+
+def run_configured_campaign(config_name='full'):
+    """Run campaign with predefined configuration"""
+    if config_name not in RUN_CONFIGURATIONS:
+        print(f"❌ Unknown configuration: {config_name}")
+        print(f"Available configurations: {list(RUN_CONFIGURATIONS.keys())}")
+        return
+    
+    config = RUN_CONFIGURATIONS[config_name]
+    print(f"🚀 Running {config_name.upper()} configuration:")
+    print(f"📝 {config['description']}")
+    print()
+    
+    scraper = CaliforniaRealEstateScraper()
+    
+    result = scraper.run_campaign(
+        cities_config=config['cities'],
+        pages_per_city=config['pages_per_city'],
+        resume=True
+    )
+    
+    if result is not None:
+        print(f"🎉 {config_name.upper()} campaign completed!")
+        print(f"📊 Final dataset: {len(result):,} listings")
+    else:
+        print(f"❌ {config_name.upper()} campaign failed")
+
+    def scrape_city_listings(self, city_info, pages_per_city=25):
+        """Scrape all listings for a single city"""
+        city_name = city_info['name']
+        city_url = city_info['url']
+        
+        logger.info(f"🏙️ Starting {city_name} - targeting {pages_per_city} pages")
+        
+        city_listings = []
+        consecutive_empty_pages = 0
+        max_empty_pages = 10
+        
+        for page in range(1, pages_per_city + 1):
+            try:
+                page_url = f"{city_url}/page-{page}" if page > 1 else city_url
+                
+                response = self.make_request_with_retry(page_url)
+                if not response:
+                    logger.warning(f"Failed to fetch page {page} for {city_name}")
+                    consecutive_empty_pages += 1
+                    if consecutive_empty_pages >= max_empty_pages:
+                        break
+                    continue
+                
+                soup = BeautifulSoup(response.content, "html.parser")
+                
+                # Try multiple selectors for listing containers
+                containers = (
+                    soup.find_all("div", {"data-testid": "property-card"}) or
+                    soup.find_all("div", {"data-testid": "search-result-card"}) or  
+                    soup.find_all("div", class_=re.compile(r"SearchResult|HomeCard|PropertyCard", re.IGNORECASE)) or
+                    soup.find_all("article") or
+                    soup.find_all("div", class_=re.compile(r"listing|property", re.IGNORECASE))
+                )   
+                
+                logger.info(f"  📄 Page {page}: {len(containers)} listings found")
+                
+                if not containers:
+                    consecutive_empty_pages += 1
+                    if consecutive_empty_pages >= max_empty_pages:
+                        logger.info(f"No more listings found for {city_name}")
+                        break
+                    continue
+                else:
+                    consecutive_empty_pages = 0
+                
+                page_valid_listings = 0
+                
+                for listing_elem in containers:
+                    try:
+                        # Extract basic listing information - UPDATED SELECTORS
+                        price_elem = (
+                            listing_elem.find("span", {"data-testid": "property-price"}) or
+                            listing_elem.find("span", class_=re.compile(r"price", re.IGNORECASE)) or
+                            listing_elem.find("div", class_=re.compile(r"price", re.IGNORECASE))
+                        )
+                        price = price_elem.get_text(strip=True) if price_elem else "N/A"
+
+                        address_elem = (
+                            listing_elem.find("div", {"data-testid": "property-address"}) or
+                            listing_elem.find("div", class_=re.compile(r"address", re.IGNORECASE)) or
+                            listing_elem.find("span", class_=re.compile(r"address", re.IGNORECASE))
+                        )
+                        address = address_elem.get_text(strip=True) if address_elem else "N/A"
+
+                        beds_elem = (
+                            listing_elem.find("span", {"data-testid": "property-beds"}) or
+                            listing_elem.find("span", class_=re.compile(r"bed", re.IGNORECASE))
+                        )
+                        beds = beds_elem.get_text(strip=True) if beds_elem else "N/A"
+
+                        baths_elem = (
+                            listing_elem.find("span", {"data-testid": "property-baths"}) or
+                            listing_elem.find("span", class_=re.compile(r"bath", re.IGNORECASE))
+                        )
+                        baths = baths_elem.get_text(strip=True) if baths_elem else "N/A"
+
+                        sqft_elem = (
+                            listing_elem.find("span", {"data-testid": "property-sqft"}) or
+                            listing_elem.find("span", class_=re.compile(r"sqft|sq-ft", re.IGNORECASE))
+                        )
+                        sqft = sqft_elem.get_text(strip=True) if sqft_elem else "N/A"
+                        
+                        # Get detail link
+                        link_elem = listing_elem.find("a", href=True)
+                        if not link_elem:
+                            continue
+                        
+                        href = link_elem['href']
+                        if href.startswith('/'):
+                            details_link = f"https://www.redfin.com{href}"
+                        else:
+                            details_link = href
+                        
+                        # Skip if already processed
+                        if details_link in self.scraped_urls:
+                            continue
+                        
+                        # Create listing data
+                        listing_data = {
+                            "Price": price,
+                            "Address": address,
+                            "Beds": beds,
+                            "Baths": baths,
+                            "Sq Ft": sqft,
+                            "Details Link": details_link,
+                            "City": city_name,
+                            "State": "CA",
+                            "Scraped_At": datetime.now().isoformat()
+                        }
+                        
+                        # Validate listing data
+                        if self.validate_listing_data(listing_data):
+                            self.scraped_urls.add(details_link)
+                            city_listings.append(listing_data)
+                            page_valid_listings += 1
+                        
+                    except Exception as e:
+                        logger.warning(f"Error processing listing in {city_name}: {e}")
+                        continue
+                
+                logger.info(f"  ✅ Page {page}: {page_valid_listings} valid listings added")
+                
+            except Exception as e:
+                logger.error(f"Error on page {page} for {city_name}: {e}")
+                consecutive_empty_pages += 1
+                if consecutive_empty_pages >= max_empty_pages:
+                    break
+                continue
+        
+        logger.info(f"✅ {city_name} complete: {len(city_listings)} listings collected")
+        # Add debug info for potential caps
+        if len(city_listings) >= 340:
+            logger.warning(f"🚨 {city_name}: Hit {len(city_listings)} listings - likely capped!")
+            logger.warning(f"    Consider increasing pages_per_city beyond {pages_per_city}")
+        return city_listings
+
+    def save_checkpoint(self, timestamp):
+        """Save comprehensive checkpoint"""
+        try:
+            checkpoint = {
+                'timestamp': timestamp,
+                'current_city_index': self.current_city_index,
+                'scraped_urls': list(self.scraped_urls),
+                'failed_urls': list(self.failed_urls),
+                'all_listings': self.all_listings,
+                'stats': self.stats
+            }
+            
+            checkpoint_file = f"data/checkpoint_{timestamp}.pkl"
+            
+            with open(checkpoint_file, 'wb') as f:
+                pickle.dump(checkpoint, f, protocol=pickle.HIGHEST_PROTOCOL)
+            
+            # Also save JSON backup (without listings to avoid size issues)
+            checkpoint_json = checkpoint.copy()
+            checkpoint_json['all_listings'] = len(checkpoint_json['all_listings'])
+            
+            json_file = f"data/checkpoint_{timestamp}.json"
+            with open(json_file, 'w') as f:
+                json.dump(checkpoint_json, f, indent=2, default=str)
+            
+            logger.info(f"💾 Checkpoint saved: {checkpoint_file} ({len(self.all_listings)} listings)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to save checkpoint: {e}")
+            return False
+    
+    def load_checkpoint(self, checkpoint_file):
+        """Load checkpoint with error handling"""
+        try:
+            if not os.path.exists(checkpoint_file):
+                return False
+            
+            with open(checkpoint_file, 'rb') as f:
+                checkpoint = pickle.load(f)
+            
+            self.current_city_index = checkpoint.get('current_city_index', 0)
+            self.scraped_urls = set(checkpoint.get('scraped_urls', []))
+            self.failed_urls = set(checkpoint.get('failed_urls', []))
+            self.all_listings = checkpoint.get('all_listings', [])
+            self.stats = checkpoint.get('stats', self.stats)
+            
+            logger.info(f"📂 Checkpoint loaded: {len(self.all_listings)} listings, city {self.current_city_index}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            return False
+    
+    def find_latest_checkpoint(self):
+        """Find most recent checkpoint"""
+        try:
+            data_dir = Path('data')
+            checkpoint_files = list(data_dir.glob('checkpoint_*.pkl'))
+            
+            if checkpoint_files:
+                latest = max(checkpoint_files, key=lambda p: p.stat().st_mtime)
+                return str(latest)
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error finding checkpoint: {e}")
+            return None
+
+    def enrich_with_details(self, listings_df, batch_size=50):
+        """Add detailed information using threading"""
+        logger.info(f"🔍 Enriching {len(listings_df)} listings with details")
+        enriched_listings = []
+        
+        for i in range(0, len(listings_df), batch_size):
+            batch = listings_df.iloc[i:i+batch_size]
+            batch_num = i // batch_size + 1
+            total_batches = (len(listings_df) // batch_size) + 1
+            
+            logger.info(f"📦 Processing batch {batch_num}/{total_batches} ({len(batch)} listings)")
+            
+            batch_enriched = []
+            
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_to_listing = {
+                    executor.submit(self.extract_listing_details, row['Details Link']): row 
+                    for _, row in batch.iterrows()
+                }
+                
+                for future in as_completed(future_to_listing):
+                    listing = future_to_listing[future]
+                    try:
+                        details = future.result()
+                        enriched = {**listing, **details}
+                        batch_enriched.append(enriched)
+                        
+                    except Exception as e:
+                        logger.warning(f"Failed to get details: {e}")
+                        batch_enriched.append(listing)  # Keep basic data
+            
+            enriched_listings.extend(batch_enriched)
+            logger.info(f"✅ Batch {batch_num} complete. Total enriched: {len(enriched_listings)}")
+            
+            # Save batch progress
+            if batch_num % 5 == 0:
+                progress_df = pd.DataFrame(enriched_listings)
+                progress_file = f"data/enriched_progress_batch_{batch_num}.csv"
+                progress_df.to_csv(progress_file, index=False)
+            
+            time.sleep(random.uniform(30, 60))
+        
+        return pd.DataFrame(enriched_listings)
+
+    def run_campaign(self, cities_config, pages_per_city=100, resume=True):
+        """Execute the comprehensive scraping campaign"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        logger.info("🚀 CALIFORNIA REAL ESTATE MEGA SCRAPING CAMPAIGN")
+        logger.info("=" * 70)
+        logger.info(f"🎯 Target Cities: {len(cities_config)}")
+        logger.info(f"📊 Estimated Listings: {len(cities_config) * pages_per_city * 20:,}")
+        logger.info(f"⏱️ Estimated Runtime: {len(cities_config) * 0.3:.1f} hours")
+        logger.info("=" * 70)
+        
+        try:
+            # Check for existing checkpoint
+            if resume:
+                latest_checkpoint = self.find_latest_checkpoint()
+                if latest_checkpoint:
+                    logger.info(f"🔄 Found checkpoint: {latest_checkpoint}")
+                    if self.load_checkpoint(latest_checkpoint):
+                        logger.info(f"📍 Resuming from city index {self.current_city_index}")
+            
+            # Phase 1: Basic listings collection
+            logger.info(f"\n🏃‍♂️ PHASE 1: BASIC LISTINGS COLLECTION")
+            logger.info(f"Starting from city {self.current_city_index + 1}/{len(cities_config)}")
+            
+            for i in range(self.current_city_index, len(cities_config)):
+                try:
+                    city_info = cities_config[i]
+                    self.current_city_index = i
+                    
+                    logger.info(f"\n🎯 City {i + 1}/{len(cities_config)}: {city_info['name']}")
+                    
+                    # Scrape this city
+                    city_listings = self.scrape_city_listings(city_info, pages_per_city)
+                    self.all_listings.extend(city_listings)
+                    
+                    # Save checkpoint every 3 cities
+                    if (i + 1) % 3 == 0:
+                        self.save_checkpoint(timestamp)
+                    
+                    # Save progress CSV
+                    if self.all_listings and (i + 1) % 2 == 0:
+                        progress_df = pd.DataFrame(self.all_listings)
+                        progress_file = f"data/progress_after_{i + 1}_cities_{timestamp}.csv"
+                        progress_df.to_csv(progress_file, index=False)
+                        logger.info(f"📊 Progress saved: {len(progress_df)} listings")
+                    
+                    logger.info(f"📈 Total collected so far: {len(self.all_listings):,} listings")
+                    
+                    # Log current stats
+                    logger.info(f"📊 Session stats: {self.stats['successful_requests']} successful, "
+                               f"{self.stats['failed_requests']} failed, "
+                               f"{self.stats['rate_limit_hits']} rate limits")
+                    
+                    # Longer delay between cities
+                    time.sleep(random.uniform(20, 40))
+                    
+                except KeyboardInterrupt:
+                    logger.info("⚠️ Interrupted by user. Saving checkpoint...")
+                    self.save_checkpoint(timestamp)
+                    break
+                except Exception as e:
+                    logger.error(f"Failed to scrape {cities_config[i]['name']}: {e}")
+                    continue
+            
+            if not self.all_listings:
+                logger.error("❌ No listings collected!")
+                return None
+            
+            # Save basic listings
+            basic_df = pd.DataFrame(self.all_listings)
+            basic_df = basic_df.drop_duplicates(subset=['Details Link'])
+            basic_file = f"data/california_basic_listings_{timestamp}.csv"
+            basic_df.to_csv(basic_file, index=False)
+            
+            logger.info(f"\n✅ PHASE 1 COMPLETE")
+            logger.info(f"📊 Collected: {len(basic_df)} unique basic listings")
+            logger.info(f"💾 Saved: {basic_file}")
+            
+            # Phase 2: Detail enrichment
+            logger.info(f"\n🔍 PHASE 2: DETAIL ENRICHMENT")
+            logger.info(f"⚠️ This will take several hours for {len(basic_df)} listings...")
+            
+            enriched_df = self.enrich_with_details(basic_df, batch_size=100)
+            
+            # Final cleanup and save
+            final_df = enriched_df.drop_duplicates(subset=['Details Link'])
+            final_file = f"data/california_real_estate_final_{timestamp}.csv"
+            final_df.to_csv(final_file, index=False)
+            
+            logger.info(f"\n🎉 CAMPAIGN COMPLETE!")
+            logger.info(f"📊 Final dataset: {len(final_df):,} unique listings")
+            logger.info(f"🏙️ Cities covered: {final_df['City'].nunique()}")
+            logger.info(f"💾 Final file: {final_file}")
+            
+            # Generate quality report
+            self.generate_quality_report(final_df)
+            
+            return final_df
+            
+        except Exception as e:
+            logger.error(f"Campaign failed with error: {e}")
+            self.save_checkpoint(timestamp)
+            return None
+
+    def generate_quality_report(self, df):
+        """Generate comprehensive data quality report"""
+        logger.info(f"\n📈 DATA QUALITY REPORT:")
+        
+        try:
+            # Basic stats
+            logger.info(f"  Total unique listings: {len(df):,}")
+            logger.info(f"  Cities covered: {df['City'].nunique()}")
+            logger.info(f"  States covered: {df['State'].nunique()}")
+            
+            # Price analysis
+            df['Price_Numeric'] = pd.to_numeric(
+                df['Price'].str.replace(r'[\$,]', '', regex=True), 
+                errors='coerce'
+            )
+            valid_prices = df['Price_Numeric'].dropna()
+            
+            if len(valid_prices) > 0:
+                logger.info(f"  Price range: ${valid_prices.min():,.0f} - ${valid_prices.max():,.0f}")
+                logger.info(f"  Median price: ${valid_prices.median():,.0f}")
+                logger.info(f"  Average price: ${valid_prices.mean():,.0f}")
+            
+            # Data completeness analysis
+            key_fields = [
+                'full_description', 'year_built', 'property_type', 
+                'total_images', 'lot_size_sqft', 'hoa_monthly_fee', 
+                'garage_spaces', 'days_on_market'
+            ]
+            
+            logger.info(f"  Data completeness:")
+            for field in key_fields:
+                if field in df.columns:
+                    valid_count = df[field].notna().sum()
+                    percentage = (valid_count / len(df)) * 100
+                    logger.info(f"    {field}: {valid_count:,}/{len(df):,} ({percentage:.1f}%)")
+            
+            # Top cities by listing count
+            top_cities = df['City'].value_counts().head(10)
+            logger.info(f"  Top 10 cities by listings:")
+            for city, count in top_cities.items():
+                logger.info(f"    {city}: {count:,} listings")
+            
+            # Property type distribution
+            if 'property_type' in df.columns:
+                prop_types = df['property_type'].value_counts()
+                logger.info(f"  Property types:")
+                for prop_type, count in prop_types.items():
+                    percentage = (count / len(df)) * 100
+                    logger.info(f"    {prop_type}: {count:,} ({percentage:.1f}%)")
+            
+        except Exception as e:
+            logger.error(f"Error generating quality report: {e}")
+
+# REVISED CALIFORNIA CITIES - FOCUS ON HIGH VOLUME + MARKET DIVERSITY
+# Removing low-volume cities, keeping representative sample
+CALIFORNIA_CITIES_MEGA = [
+    # ====== HIGH-VOLUME LUXURY MARKETS ($1M+) ======
+    {'name': 'Beverly Hills', 'url': 'https://www.redfin.com/city/1999/CA/Beverly-Hills'},
+    {'name': 'Manhattan Beach', 'url': 'https://www.redfin.com/city/11464/CA/Manhattan-Beach'},
+    {'name': 'Los Altos', 'url': 'https://www.redfin.com/city/11147/CA/Los-Altos'},
+    {'name': 'Newport Beach', 'url': 'https://www.redfin.com/city/13097/CA/Newport-Beach'},
+    
+    # ====== HIGH-VOLUME TECH HUBS ($800K-$2M) ======
+    {'name': 'Fremont', 'url': 'https://www.redfin.com/city/7115/CA/Fremont'},
+    {'name': 'Santa Clara', 'url': 'https://www.redfin.com/city/17427/CA/Santa-Clara'},
+    {'name': 'Cupertino', 'url': 'https://www.redfin.com/city/4880/CA/Cupertino'},
+    {'name': 'Milpitas', 'url': 'https://www.redfin.com/city/12145/CA/Milpitas'},
+    {'name': 'San Mateo', 'url': 'https://www.redfin.com/city/17404/CA/San-Mateo'},
+    {'name': 'Pleasanton', 'url': 'https://www.redfin.com/city/14205/CA/Pleasanton'},
+    
+    # ====== HIGH-VOLUME COASTAL PREMIUM ($700K-$1.5M) ======
+    {'name': 'Huntington Beach', 'url': 'https://www.redfin.com/city/9235/CA/Huntington-Beach'},
+    {'name': 'Irvine', 'url': 'https://www.redfin.com/city/9461/CA/Irvine'},
+    {'name': 'Carlsbad', 'url': 'https://www.redfin.com/city/3269/CA/Carlsbad'},
+    {'name': 'Santa Barbara', 'url': 'https://www.redfin.com/city/17417/CA/Santa-Barbara'},
+    
+    # ====== HIGH-VOLUME SUBURBAN ($500K-$900K) ======
+    {'name': 'Pasadena', 'url': 'https://www.redfin.com/city/13681/CA/Pasadena'},
+    {'name': 'Berkeley', 'url': 'https://www.redfin.com/city/1927/CA/Berkeley'},
+    {'name': 'Walnut Creek', 'url': 'https://www.redfin.com/city/19056/CA/Walnut-Creek'},
+    {'name': 'Chula Vista', 'url': 'https://www.redfin.com/city/4022/CA/Chula-Vista'},
+    {'name': 'Thousand Oaks', 'url': 'https://www.redfin.com/city/18368/CA/Thousand-Oaks'},
+    {'name': 'Mission Viejo', 'url': 'https://www.redfin.com/city/12190/CA/Mission-Viejo'},
+    
+    # ====== HIGH-VOLUME MIDDLE-CLASS ($400K-$700K) ======
+    {'name': 'Oceanside', 'url': 'https://www.redfin.com/city/13327/CA/Oceanside'},
+    {'name': 'Escondido', 'url': 'https://www.redfin.com/city/6493/CA/Escondido'},
+    {'name': 'Riverside', 'url': 'https://www.redfin.com/city/15683/CA/Riverside'},
+    {'name': 'Rancho Cucamonga', 'url': 'https://www.redfin.com/city/15076/CA/Rancho-Cucamonga'},
+    {'name': 'Santa Ana', 'url': 'https://www.redfin.com/city/17424/CA/Santa-Ana'},
+    {'name': 'Anaheim', 'url': 'https://www.redfin.com/city/1013/CA/Anaheim'},
+    {'name': 'Concord', 'url': 'https://www.redfin.com/city/4549/CA/Concord'},
+    {'name': 'Hayward', 'url': 'https://www.redfin.com/city/8775/CA/Hayward'},
+    
+    # ====== HIGH-VOLUME AFFORDABLE ($250K-$500K) ======
+    {'name': 'Bakersfield', 'url': 'https://www.redfin.com/city/1486/CA/Bakersfield'},
+    {'name': 'San Bernardino', 'url': 'https://www.redfin.com/city/16866/CA/San-Bernardino'},
+    {'name': 'Moreno Valley', 'url': 'https://www.redfin.com/city/12567/CA/Moreno Valley'},
+    {'name': 'Fontana', 'url': 'https://www.redfin.com/city/7021/CA/Fontana'},
+    {'name': 'Lancaster', 'url': 'https://www.redfin.com/city/10452/CA/Lancaster'},
+    {'name': 'Palmdale', 'url': 'https://www.redfin.com/city/13662/CA/Palmdale'},
+    {'name': 'Richmond', 'url': 'https://www.redfin.com/city/15646/CA/Richmond'},
+    {'name': 'Antioch', 'url': 'https://www.redfin.com/city/1139/CA/Antioch'},
+    {'name': 'Fairfield', 'url': 'https://www.redfin.com/city/6780/CA/Fairfield'},
+    {'name': 'Tracy', 'url': 'https://www.redfin.com/city/18533/CA/Tracy'},
+    {'name': 'Visalia', 'url': 'https://www.redfin.com/city/18900/CA/Visalia'},
+    
+    # ====== ADDITIONAL HIGH-VOLUME MARKETS ======
+    {'name': 'Garden Grove', 'url': 'https://www.redfin.com/city/7346/CA/Garden-Grove'},
+    {'name': 'Ontario', 'url': 'https://www.redfin.com/city/13496/CA/Ontario'},
+    {'name': 'Corona', 'url': 'https://www.redfin.com/city/4700/CA/Corona'},
+    {'name': 'Oxnard', 'url': 'https://www.redfin.com/city/13605/CA/Oxnard'},
+    {'name': 'Ventura', 'url': 'https://www.redfin.com/city/18854/CA/Ventura'},
+    {'name': 'Vacaville', 'url': 'https://www.redfin.com/city/18744/CA/Vacaville'},
+    {'name': 'Turlock', 'url': 'https://www.redfin.com/city/18618/CA/Turlock'},
+    
+    # ====== SPECIALTY MARKETS (High-volume resort/retirement) ======
+    {'name': 'Palm Springs', 'url': 'https://www.redfin.com/city/13651/CA/Palm-Springs'},
+    {'name': 'Napa', 'url': 'https://www.redfin.com/city/12939/CA/Napa'},
+    {'name': 'Davis', 'url': 'https://www.redfin.com/city/5237/CA/Davis'},
+]
+
+def main():
+    """Main execution function with OPTIMIZED configuration"""
+    print("🚀 CALIFORNIA REAL ESTATE HIGH-VOLUME SCRAPING")
+    print("=" * 70)
+    print(f"🎯 Target: {len(CALIFORNIA_CITIES_MEGA)} high-volume California cities")
+    print(f"📊 Estimated listings: 4,000-6,000")
+    print("⏱️ Estimated runtime: 6-8 hours")
+    print("💾 All progress automatically saved")
+    print("🔄 Fully resumable if interrupted")
+    print("=" * 70)
+    
+    # OPTIMIZED CONFIGURATION
+    config = {
+        'pages_per_city': 20,        
+        'resume_from_checkpoint': True,
+        'batch_size_enrichment': 50,  # REDUCED from 100 to avoid timeouts
+        'max_workers_threading': 1,   # REDUCED from 2 to avoid rate limits
+        'save_progress_every_n_cities': 1,  # INCREASED frequency
+        
+        # NEW SETTINGS FOR BETTER SUCCESS RATE
+        'delay_between_pages': 2,     # Add delay between page requests
+        'delay_between_cities': 8,    # Add delay between cities
+        'timeout_per_request': 30,    # Increase timeout
+        'max_retries': 3,            # Retry failed requests
+    }
+    
+    print(f"📋 Configuration:")
+    for key, value in config.items():
+        print(f"  {key}: {value}")
+    print()
+    
+    # Initialize scraper
+    scraper = CaliforniaRealEstateScraper()
+    
+    try:
+        # Run the campaign
+        final_dataset = scraper.run_campaign(
+            cities_config=CALIFORNIA_CITIES_MEGA,
+            pages_per_city=config['pages_per_city'],
+            resume=config['resume_from_checkpoint']
+        )
+        
+        if final_dataset is not None:
+            print(f"\n🎉 CAMPAIGN COMPLETED SUCCESSFULLY!")
+            print("=" * 50)
+            print(f"📊 Final Results:")
+            print(f"  Total listings: {len(final_dataset):,}")
+            print(f"  Cities covered: {final_dataset['City'].nunique()}")
+            print(f"  Unique property types: {final_dataset.get('property_type', pd.Series()).nunique()}")
+            
+            # Price analysis
+            try:
+                prices = pd.to_numeric(
+                    final_dataset['Price'].str.replace(r'[\$,]', '', regex=True), 
+                    errors='coerce'
+                ).dropna()
+                
+                if len(prices) > 0:
+                    print(f"  Price range: ${prices.min():,.0f} - ${prices.max():,.0f}")
+                    print(f"  Median price: ${prices.median():,.0f}")
+            except:
+                pass
+            
+            print(f"\n💾 Files created:")
+            print(f"  📁 data/california_real_estate_final_*.csv (main dataset)")
+            print(f"  📁 data/california_basic_listings_*.csv (basic data)")
+            print(f"  📁 data/progress_*.csv (progress checkpoints)")
+            print(f"  📁 logs/scraping_*.log (detailed logs)")
+            
+            print(f"\n🚀 Ready for ML modeling!")
+            print(f"This dataset contains {len(final_dataset):,} California real estate listings")
+            print(f"with rich features including descriptions, property types, and market data.")
+            
+        else:
+            print("\n❌ Campaign failed - check logs for details")
+            print("💡 You can restart to resume from the last checkpoint")
+            
+    except KeyboardInterrupt:
+        print("\n⚠️ Campaign interrupted by user")
+        print("💾 All progress has been automatically saved")
+        print("🔄 Run the script again to resume from where you left off")
+        
+    except Exception as e:
+        print(f"\n❌ Campaign failed with error: {e}")
+        print("📋 Check the log files in the 'logs' directory for detailed error information")
+        print("💾 Progress has been saved - you can restart to resume")
+        
+    finally:
+        # Cleanup and final statistics
+        try:
+            scraper.generate_quality_report(pd.DataFrame(scraper.all_listings))
+        except:
+            pass
+
+def quick_test_run():
+    """Quick test with just a few cities for testing purposes"""
+    print("🧪 QUICK TEST RUN - 3 cities only")
+    
+    test_cities = CALIFORNIA_CITIES_MEGA[:3]  # Just first 3 cities
+    
+    scraper = CaliforniaRealEstateScraper()
+    
+    result = scraper.run_campaign(
+        cities_config=test_cities,
+        pages_per_city=5,  # Just 5 pages per city
+        resume=True
+    )
+    
+    if result is not None:
+        print(f"✅ Test completed: {len(result)} listings collected")
+    else:
+        print("❌ Test failed")
+
+def resume_campaign():
+    """Resume a previously interrupted campaign"""
+    print("🔄 RESUMING PREVIOUS CAMPAIGN")
+    
+    scraper = CaliforniaRealEstateScraper()
+    
+    # Find and load latest checkpoint
+    latest_checkpoint = scraper.find_latest_checkpoint()
+    if latest_checkpoint:
+        print(f"📂 Found checkpoint: {latest_checkpoint}")
+        if scraper.load_checkpoint(latest_checkpoint):
+            print(f"✅ Resuming from city {scraper.current_city_index + 1}")
+            print(f"📊 {len(scraper.all_listings)} listings already collected")
+            
+            # Continue the campaign
+            result = scraper.run_campaign(
+                cities_config=CALIFORNIA_CITIES_MEGA,
+                pages_per_city=30,
+                resume=True
+            )
+            
+            if result is not None:
+                print(f"🎉 Campaign completed: {len(result)} total listings")
+        else:
+            print("❌ Failed to load checkpoint")
+    else:
+        print("❌ No checkpoint found - starting fresh campaign")
+        main()
+
+# Command-line interface
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1:
+        command = sys.argv[1].lower()
+        
+        if command == "test":
+            quick_test_run()
+        elif command == "resume":
+            resume_campaign()
+        elif command == "main" or command == "full":
+            main()
+        else:
+            print("Usage:")
+            print("  python scraper.py          # Run full campaign")
+            print("  python scraper.py main     # Run full campaign") 
+            print("  python scraper.py test     # Quick test (3 cities)")
+            print("  python scraper.py resume   # Resume interrupted campaign")
+    else:
+        # Default: run full campaign
+        main()
+
+# OPTIONAL: Additional utility functions you can add
+
+def analyze_existing_data(csv_file_path):
+    """Analyze an existing dataset"""
+    try:
+        df = pd.read_csv(csv_file_path)
+        print(f"📊 Dataset Analysis: {csv_file_path}")
+        print(f"  Total listings: {len(df):,}")
+        print(f"  Columns: {len(df.columns)}")
+        print(f"  Cities: {df['City'].nunique() if 'City' in df.columns else 'N/A'}")
+        
+        if 'Price' in df.columns:
+            prices = pd.to_numeric(df['Price'].str.replace(r'[\$,]', '', regex=True), errors='coerce')
+            valid_prices = prices.dropna()
+            if len(valid_prices) > 0:
+                print(f"  Price range: ${valid_prices.min():,.0f} - ${valid_prices.max():,.0f}")
+                print(f"  Median price: ${valid_prices.median():,.0f}")
+        
+        print(f"  Sample columns: {list(df.columns)[:10]}")
+        
+    except Exception as e:
+        print(f"❌ Error analyzing data: {e}")
+
+def combine_datasets(*csv_files):
+    """Combine multiple CSV files into one"""
+    try:
+        all_dfs = []
+        for file_path in csv_files:
+            df = pd.read_csv(file_path)
+            all_dfs.append(df)
+            print(f"📁 Loaded {len(df)} listings from {file_path}")
+        
+        combined_df = pd.concat(all_dfs, ignore_index=True)
+        combined_df = combined_df.drop_duplicates(subset=['Details Link'] if 'Details Link' in combined_df.columns else None)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = f"data/combined_california_listings_{timestamp}.csv"
+        combined_df.to_csv(output_file, index=False)
+        
+        print(f"✅ Combined dataset saved: {output_file}")
+        print(f"📊 Total unique listings: {len(combined_df):,}")
+        
+        return output_file
+        
+    except Exception as e:
+        print(f"❌ Error combining datasets: {e}")
+        return None
+
+# Configuration for different run modes
+RUN_CONFIGURATIONS = {
+    'quick': {
+        'cities': CALIFORNIA_CITIES_MEGA[:5],
+        'pages_per_city': 10,
+        'description': 'Quick test with 5 cities, 10 pages each (~1000 listings)'
+    },
+    'medium': {
+        'cities': CALIFORNIA_CITIES_MEGA[:20],
+        'pages_per_city': 20,
+        'description': 'Medium run with 20 cities, 20 pages each (~8000 listings)'
+    },
+    'full': {
+        'cities': CALIFORNIA_CITIES_MEGA,
+        'pages_per_city': 30,
+        'description': 'Full campaign - all cities, 30 pages each (~25000+ listings)'
+    },
+    'mega': {
+        'cities': CALIFORNIA_CITIES_MEGA,
+        'pages_per_city': 50,
+        'description': 'Mega campaign - all cities, 50 pages each (~50000+ listings)'
+    }
+}
+
+def run_configured_campaign(config_name='full'):
+    """Run campaign with predefined configuration"""
+    if config_name not in RUN_CONFIGURATIONS:
+        print(f"❌ Unknown configuration: {config_name}")
+        print(f"Available configurations: {list(RUN_CONFIGURATIONS.keys())}")
+        return
+    
+    config = RUN_CONFIGURATIONS[config_name]
+    print(f"🚀 Running {config_name.upper()} configuration:")
+    print(f"📝 {config['description']}")
+    print()
+    
+    scraper = CaliforniaRealEstateScraper()
+    
+    result = scraper.run_campaign(
+        cities_config=config['cities'],
+        pages_per_city=config['pages_per_city'],
+        resume=True
+    )
+    
+    if result is not None:
+        print(f"🎉 {config_name.upper()} campaign completed!")
+        print(f"📊 Final dataset: {len(result):,} listings")
+    else:
+        print(f"❌ {config_name.upper()} campaign failed")
