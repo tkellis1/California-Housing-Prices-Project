@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""
+Real Estate Data Preprocessing Pipeline - FIXED VERSION
+Processes dataset2.csv with 4.2k listings for machine learning
+"""
+
+import pandas as pd
+import numpy as np
+import re
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+# Load the dataset
+print("Loading dataset2.csv...")
+df = pd.read_csv('/Users/tiffanyellis/Documents/my_projects/Housing Prices Project/data/dataset2.csv')
+
+print(f"Initial dataset shape: {df.shape}")
+print(f"Columns: {list(df.columns)}")
+
+# 1. DATA QUALITY ASSESSMENT
+print("\n" + "="*50)
+print("1. DATA QUALITY ASSESSMENT")
+print("="*50)
+
+print("\nMissing values per column:")
+print(df.isnull().sum())
+
+print("\nData types:")
+print(df.dtypes)
+
+print("\nFirst few rows:")
+print(df.head())
+
+print("\nSample of raw data to understand format:")
+print("Price column sample:", df['Price'].head(3).tolist())
+print("Sq Ft column sample:", df['Sq Ft'].head(3).tolist())
+print("Beds column sample:", df['Beds'].head(3).tolist())
+print("Baths column sample:", df['Baths'].head(3).tolist())
+
+# 2. BASIC DATA CLEANING - FIXED REGEX PATTERNS
+print("\n" + "="*50)
+print("2. BASIC DATA CLEANING")
+print("="*50)
+
+# Clean price data
+print("Cleaning price data...")
+df['price_numeric'] = df['Price'].str.replace(r'[\$,]', '', regex=True)
+df['price_numeric'] = pd.to_numeric(df['price_numeric'], errors='coerce')
+print(f"Valid prices after cleaning: {df['price_numeric'].notna().sum()}")
+
+# Clean square footage - FIXED PATTERN
+print("Cleaning square footage data...")
+# Extract digits and commas, remove "sq ft" and other text
+df['sqft_numeric'] = df['Sq Ft'].str.extract(r'([\d,]+)', expand=False)
+df['sqft_numeric'] = df['sqft_numeric'].str.replace(',', '', regex=False)
+df['sqft_numeric'] = pd.to_numeric(df['sqft_numeric'], errors='coerce')
+print(f"Valid sqft after cleaning: {df['sqft_numeric'].notna().sum()}")
+
+# Clean beds - FIXED PATTERN
+print("Cleaning beds data...")
+# Extract digits from patterns like "3 beds", "— beds"
+df['beds_numeric'] = df['Beds'].str.extract(r'(\d+)', expand=False)
+df['beds_numeric'] = pd.to_numeric(df['beds_numeric'], errors='coerce')
+print(f"Valid beds after cleaning: {df['beds_numeric'].notna().sum()}")
+
+# Clean baths - FIXED PATTERN
+print("Cleaning baths data...")
+# Extract digits and decimals from patterns like "2.5 baths", "1 bath"
+df['baths_numeric'] = df['Baths'].str.extract(r'(\d+\.?\d*)', expand=False)
+df['baths_numeric'] = pd.to_numeric(df['baths_numeric'], errors='coerce')
+print(f"Valid baths after cleaning: {df['baths_numeric'].notna().sum()}")
+
+# Extract ZIP codes from addresses
+print("Extracting ZIP codes...")
+df['zip_code'] = df['Address'].str.extract(r'(\d{5})', expand=False)
+print(f"Successfully extracted ZIP codes for {df['zip_code'].notna().sum()} listings")
+
+# Show sample of cleaned data
+print("\nSample of cleaned numeric data:")
+sample_cols = ['Price', 'price_numeric', 'Sq Ft', 'sqft_numeric', 'Beds', 'beds_numeric', 'Baths', 'baths_numeric']
+print(df[sample_cols].head(10))
+
+# 3. FEATURE ENGINEERING
+print("\n" + "="*50)
+print("3. FEATURE ENGINEERING")
+print("="*50)
+
+# Price per square foot
+df['price_per_sqft'] = df['price_numeric'] / df['sqft_numeric']
+print("Created price_per_sqft feature")
+print(f"Valid price_per_sqft values: {df['price_per_sqft'].notna().sum()}")
+
+# Age of home (if year_built column exists)
+current_year = 2025
+if 'year_built' in df.columns:
+    df['home_age'] = current_year - df['year_built']
+    df['home_age'] = df['home_age'].clip(0, 200)  # Cap at reasonable values
+    print("Created home_age feature")
+else:
+    print("No 'year_built' column found - skipping home_age feature")
+    df['home_age'] = np.nan
+
+# Lot size to house size ratio (if lot_size_sqft exists)
+if 'lot_size_sqft' in df.columns:
+    df['lot_to_house_ratio'] = df['lot_size_sqft'] / df['sqft_numeric']
+    print("Created lot_to_house_ratio feature")
+else:
+    print("No 'lot_size_sqft' column found - skipping ratio feature")
+    df['lot_to_house_ratio'] = np.nan
+
+# City-based pricing features
+print("Creating city-based pricing features...")
+city_stats = df.groupby('City')['price_numeric'].agg(['mean', 'median', 'count']).reset_index()
+city_stats.columns = ['City', 'city_price_mean', 'city_price_median', 'city_listing_count']
+
+df = df.merge(city_stats, on='City', how='left')
+
+# Price vs city average
+df['price_vs_city_avg'] = (df['price_numeric'] - df['city_price_mean']) / df['city_price_mean']
+print("Created price_vs_city_avg feature")
+
+# Listing quality proxy (using available columns)
+quality_score = 0
+
+# Check for total_images column
+if 'total_images' in df.columns:
+    quality_score += df['total_images'].fillna(1) / 10
+    print("Added total_images to quality score")
+else:
+    print("No 'total_images' column found")
+
+# Check for garage_spaces column
+if 'garage_spaces' in df.columns:
+    quality_score += (df['garage_spaces'].fillna(0) > 0).astype(int)
+    print("Added garage_spaces to quality score")
+else:
+    print("No 'garage_spaces' column found")
+
+# Check for HOA column
+if 'hoa_monthly_fee' in df.columns:
+    quality_score += (df['hoa_monthly_fee'].notna()).astype(int)
+    print("Added hoa_monthly_fee to quality score")
+else:
+    print("No 'hoa_monthly_fee' column found")
+
+df['listing_quality_score'] = quality_score
+print("Created listing_quality_score feature")
+
+# 4. NLP ON PROPERTY DESCRIPTIONS (if available)
+print("\n" + "="*50)
+print("4. NLP ON PROPERTY DESCRIPTIONS")
+print("="*50)
+
+# Check if description column exists
+description_col = None
+for col in ['full_description', 'description', 'Description', 'details']:
+    if col in df.columns:
+        description_col = col
+        break
+
+if description_col:
+    print(f"Processing property descriptions from '{description_col}' column...")
+    # Fill missing descriptions
+    df['description_clean'] = df[description_col].fillna('').str.lower()
+
+    # Recently renovated
+    df['recently_renovated'] = df['description_clean'].str.contains(
+        r'renovated|remodeled|updated|new kitchen|new bath|newly', na=False
+    ).astype(int)
+
+    # Open floor plan
+    df['open_floor_plan'] = df['description_clean'].str.contains(
+        r'open floor|open concept|great room|flowing layout|spacious layout', na=False
+    ).astype(int)
+
+    # Luxury features
+    df['luxury_features'] = df['description_clean'].str.contains(
+        r'granite|marble|hardwood|stainless steel|high-end|luxury|premium|custom|designer', na=False
+    ).astype(int)
+
+    # Outdoor features
+    df['outdoor_features'] = df['description_clean'].str.contains(
+        r'pool|spa|patio|deck|garden|yard|outdoor kitchen|backyard|landscap', na=False
+    ).astype(int)
+
+    # Modern amenities
+    df['modern_amenities'] = df['description_clean'].str.contains(
+        r'smart home|wifi|fiber|solar|energy efficient|led|modern appliance', na=False
+    ).astype(int)
+
+    # View features
+    df['has_view'] = df['description_clean'].str.contains(
+        r'view|mountain|ocean|city view|panoramic|scenic', na=False
+    ).astype(int)
+
+    nlp_features = ['recently_renovated', 'open_floor_plan', 'luxury_features', 
+                   'outdoor_features', 'modern_amenities', 'has_view']
+
+    for feature in nlp_features:
+        count = df[feature].sum()
+        percentage = (count / len(df)) * 100
+        print(f"  {feature}: {count} listings ({percentage:.1f}%)")
+else:
+    print("No description column found - skipping NLP features")
+    print("Available columns:", list(df.columns))
+    
+    # Create placeholder NLP features (all zeros)
+    nlp_features = ['recently_renovated', 'open_floor_plan', 'luxury_features', 
+                   'outdoor_features', 'modern_amenities', 'has_view']
+    
+    for feature in nlp_features:
+        df[feature] = 0
+    
+    print("Created placeholder NLP features (all set to 0)")
+
+# 5. HANDLE MISSING DATA
+print("\n" + "="*50)
+print("5. HANDLING MISSING DATA")
+print("="*50)
+
+# Remove listings with critical missing data
+initial_count = len(df)
+df = df.dropna(subset=['price_numeric', 'City', 'Address'])
+print(f"Removed {initial_count - len(df)} listings with missing critical data")
+
+# Fill missing values intelligently
+print("Filling missing values...")
+
+# Square footage - use city median
+if df['sqft_numeric'].notna().sum() > 0:
+    df['sqft_numeric'].fillna(df.groupby('City')['sqft_numeric'].transform('median'), inplace=True)
+    print("Filled missing sqft with city medians")
+
+# Beds and baths - use reasonable defaults based on sqft
+if df['beds_numeric'].isna().sum() > 0:
+    df['beds_numeric'].fillna(np.floor(df['sqft_numeric'] / 500).clip(1, 10), inplace=True)
+    print("Filled missing beds based on sqft")
+
+if df['baths_numeric'].isna().sum() > 0:
+    df['baths_numeric'].fillna((df['beds_numeric'] * 0.75).clip(1, 8), inplace=True)
+    print("Filled missing baths based on beds")
+
+print("Missing values after cleaning:")
+key_cols = ['price_numeric', 'sqft_numeric', 'beds_numeric', 'baths_numeric']
+print(df[key_cols].isnull().sum())
+
+# 6. OUTLIER DETECTION AND REMOVAL
+print("\n" + "="*50)
+print("6. OUTLIER DETECTION AND REMOVAL")
+print("="*50)
+
+initial_count = len(df)
+
+# Check current data ranges
+print("Current data ranges:")
+print(f"Price: ${df['price_numeric'].min():,.0f} to ${df['price_numeric'].max():,.0f}")
+print(f"Sqft: {df['sqft_numeric'].min():.0f} to {df['sqft_numeric'].max():,.0f}")
+print(f"Price/sqft: ${df['price_per_sqft'].min():.0f} to ${df['price_per_sqft'].max():,.0f}")
+
+# Remove obvious outliers
+outlier_conditions = (
+    (df['price_numeric'] >= 50000) & 
+    (df['price_numeric'] <= 15000000) &
+    (df['sqft_numeric'] >= 300) & 
+    (df['sqft_numeric'] <= 15000) &
+    (df['beds_numeric'] <= 10) &
+    (df['baths_numeric'] <= 15)
+)
+
+df = df[outlier_conditions]
+print(f"After basic outlier removal: {len(df)} listings")
+
+# Remove price per sqft outliers
+if df['price_per_sqft'].notna().sum() > 0:
+    df = df[(df['price_per_sqft'] >= 20) & (df['price_per_sqft'] <= 2000)]
+    print(f"After price/sqft outlier removal: {len(df)} listings")
+
+print(f"Total removed: {initial_count - len(df)} outliers")
+print(f"Final dataset shape: {df.shape}")
+
+# 7. CREATE CATEGORICAL FEATURES
+print("\n" + "="*50)
+print("7. CREATING CATEGORICAL FEATURES")
+print("="*50)
+
+if len(df) > 0:
+    # Price tiers
+    df['price_tier'] = pd.cut(df['price_numeric'], 
+                             bins=[0, 500000, 1000000, 2000000, float('inf')],
+                             labels=['Budget', 'Mid-range', 'High-end', 'Luxury'])
+
+    # Size categories
+    df['size_category'] = pd.cut(df['sqft_numeric'],
+                                bins=[0, 1200, 2000, 3000, float('inf')],
+                                labels=['Small', 'Medium', 'Large', 'Very Large'])
+
+    # Age categories (if we have age data)
+    if 'home_age' in df.columns and df['home_age'].notna().sum() > 0:
+        df['age_category'] = pd.cut(df['home_age'],
+                                   bins=[-1, 5, 20, 50, float('inf')],
+                                   labels=['New', 'Modern', 'Established', 'Vintage'])
+    else:
+        df['age_category'] = 'Unknown'
+
+    print("Created categorical features: price_tier, size_category, age_category")
+
+# 8. GENERATE SUMMARY STATISTICS
+print("\n" + "="*50)
+print("8. FINAL DATASET SUMMARY")
+print("="*50)
+
+if len(df) > 0:
+    print(f"Final dataset shape: {df.shape}")
+    print(f"Cities represented: {df['City'].nunique()}")
+    print(f"ZIP codes: {df['zip_code'].nunique()}")
+
+    print("\nPrice statistics:")
+    print(df['price_numeric'].describe())
+
+    print("\nTop 10 cities by listing count:")
+    print(df['City'].value_counts().head(10))
+
+    print("\nFeature correlation with price:")
+    numeric_features = ['sqft_numeric', 'beds_numeric', 'baths_numeric', 'price_per_sqft']
+    
+    # Add other numeric features if they exist
+    optional_features = ['home_age', 'lot_size_sqft', 'garage_spaces', 'total_images']
+    for feat in optional_features:
+        if feat in df.columns and df[feat].notna().sum() > 0:
+            numeric_features.append(feat)
+
+    correlations = df[numeric_features + ['price_numeric']].corr()['price_numeric'].sort_values(ascending=False)
+    print(correlations.drop('price_numeric'))
+
+    print("\nNLP feature distribution:")
+    for feature in nlp_features:
+        count = df[feature].sum()
+        percentage = (count / len(df)) * 100
+        print(f"  {feature}: {count} ({percentage:.1f}%)")
+
+    # 9. SAVE PROCESSED DATA
+    print("\n" + "="*50)
+    print("9. SAVING PROCESSED DATA")
+    print("="*50)
+
+    # Select final features for modeling
+    model_features = [
+        # Target variable
+        'price_numeric',
+        
+        # Basic property features
+        'sqft_numeric', 'beds_numeric', 'baths_numeric',
+        
+        # Derived features
+        'price_per_sqft', 'listing_quality_score',
+        
+        # Location features
+        'City', 'zip_code', 'city_price_mean', 'city_price_median', 'price_vs_city_avg',
+        
+        # NLP features
+        'recently_renovated', 'open_floor_plan', 'luxury_features',
+        'outdoor_features', 'modern_amenities', 'has_view',
+        
+        # Categorical features
+        'price_tier', 'size_category', 'age_category',
+        
+        # Original data for reference
+        'Address'
+    ]
+    
+    # Add optional features if they exist
+    optional_features = ['home_age', 'lot_size_sqft', 'lot_to_house_ratio', 'garage_spaces', 'total_images', 'property_type']
+    for feat in optional_features:
+        if feat in df.columns:
+            model_features.append(feat)
+    
+    # Add Details Link if it exists
+    if 'Details Link' in df.columns:
+        model_features.append('Details Link')
+
+    # Create final dataset with only available features
+    available_features = [feat for feat in model_features if feat in df.columns]
+    df_final = df[available_features].copy()
+
+    # Save processed dataset
+    output_filename = 'dataset2_processed.csv'
+    df_final.to_csv(output_filename, index=False)
+
+    print(f"Processed dataset saved as: {output_filename}")
+    print(f"Shape: {df_final.shape}")
+    print(f"Features ready for modeling: {len(available_features) - 2}")  # Subtract reference columns
+
+    print("\n" + "="*50)
+    print("PREPROCESSING COMPLETE!")
+    print("="*50)
+    print("\nNext steps:")
+    print("1. Load dataset2_processed.csv for modeling")
+    print("2. Split into train/test sets")
+    print("3. Apply feature scaling if needed")
+    print("4. Train machine learning models")
+    print("5. Evaluate model performance")
+else:
+    print("ERROR: No data remaining after preprocessing!")
+    print("Check your outlier removal conditions - they may be too strict.")
